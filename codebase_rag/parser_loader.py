@@ -89,6 +89,13 @@ def _import_language_loaders() -> dict[str, LanguageLoader]:
     loaders: dict[str, LanguageLoader] = {}
 
     try:
+        from tree_sitter_c import language as c_language_so
+
+        loaders["c"] = c_language_so
+    except ImportError:
+        loaders["c"] = _try_load_from_submodule("c")
+
+    try:
         from tree_sitter_python import language as python_language_so
 
         loaders["python"] = python_language_so

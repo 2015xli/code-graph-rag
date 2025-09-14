@@ -9,6 +9,7 @@ from tree_sitter import Node, QueryCursor
 
 from ..language_config import LanguageConfig
 from ..services.graph_service import MemgraphIngestor
+from .c_utils import build_c_qualified_name, extract_c_function_name
 
 # No longer need constants import - using Tree-sitter directly
 from .cpp_utils import convert_operator_symbol_to_name, extract_cpp_function_name
@@ -122,7 +123,10 @@ class CallProcessor:
 
             self._process_calls_in_functions(root_node, module_qn, language, queries)
             self._process_calls_in_classes(root_node, module_qn, language, queries)
-            self._process_module_level_calls(root_node, module_qn, language, queries)
+            if language != "c":
+                self._process_module_level_calls(
+                    root_node, module_qn, language, queries
+                )
 
         except Exception as e:
             logger.error(f"Failed to process calls in {file_path}: {e}")
@@ -150,6 +154,12 @@ class CallProcessor:
                 func_name = extract_cpp_function_name(func_node)
                 if not func_name:
                     continue
+            elif language == "c":
+                func_name = extract_c_function_name(func_node)
+                if not func_name:
+                    continue
+                func_qn = build_c_qualified_name(func_node, module_qn, func_name)
+
             else:
                 name_node = func_node.child_by_field_name("name")
                 if not name_node:
@@ -158,9 +168,11 @@ class CallProcessor:
                 if text is None:
                     continue
                 func_name = text.decode("utf8")
-            func_qn = self._build_nested_qualified_name(
-                func_node, module_qn, func_name, lang_config
-            )
+
+            if func_qn is None:
+                func_qn = self._build_nested_qualified_name(
+                    func_node, module_qn, func_name, lang_config
+                )
 
             if func_qn:
                 self._ingest_function_calls(

@@ -14,6 +14,10 @@ from tree_sitter import Node, Query, QueryCursor
 
 from ..language_config import LanguageConfig
 from ..services.graph_service import MemgraphIngestor
+from .c_utils import (
+    build_c_qualified_name,
+    extract_c_function_name,
+)
 
 # No longer need constants import - using Tree-sitter directly
 from .cpp_utils import (
@@ -621,6 +625,13 @@ class DefinitionProcessor:
                 func_qn = build_cpp_qualified_name(func_node, module_qn, func_name)
                 # Check if this is an exported function
                 is_exported = is_cpp_exported(func_node)
+            elif language == "c":
+                func_name = extract_c_function_name(func_node)
+                if func_name is None:
+                    continue  # Skip if we couldn't extract a function name
+                func_qn = build_c_qualified_name(func_node, module_qn, func_name)
+                is_exported = True
+
             else:
                 is_exported = False  # Default for non-C++ languages
                 # Extract function name - handle arrow functions specially
@@ -668,7 +679,10 @@ class DefinitionProcessor:
             self.ingestor.ensure_node_batch("Function", func_props)
 
             self.function_registry[func_qn] = "Function"
-            self.simple_name_lookup[func_name].add(func_qn)
+            if (
+                func_name is not None
+            ):  # Only add to simple_name_lookup if func_name is not None
+                self.simple_name_lookup[func_name].add(func_qn)
 
             # Determine parent and create proper relationship
             parent_type, parent_qn = self._determine_function_parent(

@@ -16,6 +16,7 @@ from tree_sitter import Node, Parser
 
 from .config import IGNORE_PATTERNS
 from .language_config import get_language_config
+from .parsers.c_utils import determine_if_cpp_header
 from .parsers.factory import ProcessorFactory
 from .services.graph_service import MemgraphIngestor
 
@@ -244,6 +245,8 @@ class GraphUpdater:
         self.simple_name_lookup: dict[str, set[str]] = defaultdict(set)
         self.ast_cache = BoundedASTCache(max_entries=1000, max_memory_mb=500)
         self.ignore_dirs = IGNORE_PATTERNS
+        self.c_folders: list[Path] = []
+        self.cpp_folders: list[Path] = []
 
         # Create processor factory with all dependencies
         self.factory = ProcessorFactory(
@@ -369,9 +372,26 @@ class GraphUpdater:
 
         # Use pathlib.rglob for more efficient file iteration
         for filepath in self.repo_path.rglob("*"):
+            suffix = filepath.suffix
             if filepath.is_file() and not should_skip_path(filepath):
+                if suffix == ".h":
+                    if (
+                        filepath.parent not in self.c_folders
+                        and filepath.parent not in self.cpp_folders
+                    ):
+                        is_cpp_header = determine_if_cpp_header(
+                            filepath, self.parsers["cpp"]
+                        )
+                        if is_cpp_header:
+                            self.cpp_folders.append(filepath.parent)
+                            suffix = ".hpp"
+                        else:
+                            self.c_folders.append(filepath.parent)
+                    elif filepath.parent in self.cpp_folders:
+                        suffix = ".hpp"
+
                 # Check if this file type is supported for parsing
-                lang_config = get_language_config(filepath.suffix)
+                lang_config = get_language_config(suffix)
                 if lang_config and lang_config.name in self.parsers:
                     # Parse as Module and cache AST
                     result = self.factory.definition_processor.process_file(
