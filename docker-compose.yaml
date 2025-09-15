@@ -1,13 +1,19 @@
-version: "3"
 services:
   memgraph:
     image: memgraph/memgraph-mage
     ports:
       - "${MEMGRAPH_PORT:-7687}:7687"
       - "${MEMGRAPH_HTTP_PORT:-7444}:7444"
+    command: ["--query-execution-timeout-sec=0"]
+    volumes:
+      - code-graph:/var/lib/memgraph
   lab:
     image: memgraph/lab
     ports:
       - "${LAB_PORT:-3000}:3000"
     environment:
-      QUICK_CONNECT_MG_HOST: memgraph
+        QUICK_CONNECT_MG_HOST: memgraph
+        QUICK_CONNECT_MG_PORT: 7687
+        QUICK_CONNECT_MG_LOGS_PORT: 7444
+volumes:
+  code-graph:

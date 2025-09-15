@@ -148,6 +148,7 @@ class CallProcessor:
             if self._is_method(func_node, lang_config):
                 continue
 
+            func_qn = None
             # Extract function name using appropriate method for language
             if language == "cpp":
                 # For C++, use utility functions instead of creating a temporary instance

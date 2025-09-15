@@ -285,6 +285,7 @@ LANGUAGE_CONFIGS = {
     ),
     "cpp": create_lang_config(
         file_extensions=[
+            # ".c",
             ".cpp",
             ".h",
             ".hpp",
