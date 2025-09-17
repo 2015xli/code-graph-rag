@@ -17,6 +17,7 @@ from ..services.graph_service import MemgraphIngestor
 from .c_utils import (
     build_c_qualified_name,
     extract_c_function_name,
+    is_c_exported,
 )
 
 # No longer need constants import - using Tree-sitter directly
@@ -167,7 +168,9 @@ class DefinitionProcessor:
                 self._ingest_cpp_module_declarations(
                     root_node, module_qn, file_path, queries
                 )
-            self._ingest_all_functions(root_node, module_qn, language, queries)
+            self._ingest_all_functions(
+                root_node, module_qn, language, queries, file_path
+            )
             self._ingest_classes_and_methods(root_node, module_qn, language, queries)
             self._ingest_object_literal_methods(root_node, module_qn, language, queries)
             self._ingest_commonjs_exports(root_node, module_qn, language, queries)
@@ -590,7 +593,12 @@ class DefinitionProcessor:
         )
 
     def _ingest_all_functions(
-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+        self,
+        root_node: Node,
+        module_qn: str,
+        language: str,
+        queries: dict[str, Any],
+        file_path: Path,
     ) -> None:
         """Extract and ingest all functions (including nested ones)."""
         lang_queries = queries[language]
@@ -627,11 +635,10 @@ class DefinitionProcessor:
                 is_exported = is_cpp_exported(func_node)
             elif language == "c":
                 func_name = extract_c_function_name(func_node)
-                if func_name is None:
-                    continue  # Skip if we couldn't extract a function name
+                if not func_name:
+                    continue
                 func_qn = build_c_qualified_name(func_node, module_qn, func_name)
-                is_exported = True
-
+                is_exported = is_c_exported(func_node, file_path)
             else:
                 is_exported = False  # Default for non-C++ languages
                 # Extract function name - handle arrow functions specially
@@ -703,11 +710,16 @@ class DefinitionProcessor:
                 )
 
     def _ingest_top_level_functions(
-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+        self,
+        root_node: Node,
+        module_qn: str,
+        language: str,
+        queries: dict[str, Any],
+        file_path: Path,
     ) -> None:
         """Extract and ingest top-level functions. (Legacy method, replaced by _ingest_all_functions)"""
         # Keep for backward compatibility, but delegate to new method
-        self._ingest_all_functions(root_node, module_qn, language, queries)
+        self._ingest_all_functions(root_node, module_qn, language, queries, file_path)
 
     def _build_nested_qualified_name(
         self,

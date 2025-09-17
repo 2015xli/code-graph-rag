@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from loguru import logger
 from tree_sitter import Node, Parser
 
 
@@ -109,10 +110,8 @@ CPP_ONLY_NODE_TYPES = {
     "alignas_specifier",  # C++11 alignas
     "attribute_declaration",  # [[nodiscard]] etc.
     "auto",  # auto type deduction
-    "cast_expression",  # static_cast / dynamic_cast / etc.
     "class_specifier",  # class definitions
     "concept_definition",  # C++20 concept
-    "condition_clause",  # C++ specific if/switch condition forms
     "decltype_specifier",  # decltype(x)
     "delete_expression",  # delete ptr
     "dependent_type_specifier",  # dependent types in templates
@@ -137,7 +136,6 @@ CPP_ONLY_NODE_TYPES = {
     "template_type",
     "this",  # this pointer
     "throw_specifier",  # throw() specifiers (older C++)
-    "type_qualifier",  # constexpr, consteval, constinit etc.
     "using_declaration",  # using namespace etc.
     "virtual_function_specifier",  # virtual keyword
     "virtual_specifier",  # final, etc.
@@ -155,17 +153,31 @@ def determine_if_cpp_header(file_path: Path, cpp_parser: Parser) -> bool:
     # 1. Sibling check: same directory, any file with C++ suffix
     parent = file_path.parent
     try:
+        has_c_source = False
         for sibling in parent.iterdir():
             if sibling == file_path:
                 continue
             if sibling.is_file():
                 if sibling.suffix.lower() in CPP_SOURCE_SUFFIXES:
+                    logger.info(
+                        f"'{file_path.name}' is likely a C++ header due to sibling file: '{sibling.name}'"
+                    )
                     return True
+                elif sibling.suffix.lower() == ".c":
+                    has_c_source = True
+
+        if has_c_source:
+            # If there is no C++ source file, but is C source files, then it's a C header
+            logger.info(
+                f"'{file_path.name}' is likely a C header due to sibling file: '{sibling.name}'"
+            )
+            return False
+
     except Exception:
         # If directory listing fails, ignore sibling heuristic
         pass
 
-    # 2. Parse with tree-sitter-cpp parser
+    # 2. Parse with tree-sitter-cpp parser, since there is no C++ or C source file
     try:
         source_bytes = file_path.read_bytes()
         # Alternatively: read text and encode utf-8
@@ -181,18 +193,46 @@ def determine_if_cpp_header(file_path: Path, cpp_parser: Parser) -> bool:
     root: Node = tree.root_node
 
     # Recursive search for any node whose type is in CPP_ONLY_NODE_TYPES
-    def has_cpp_type(node: Node) -> bool:
+    def find_cpp_node(node: Node) -> Node | None:
         if node.type in CPP_ONLY_NODE_TYPES:
-            return True
+            return node
         # Recurse into named children (faster / more relevant than all children)
         for child in node.named_children:
             # Early exit
-            if has_cpp_type(child):
-                return True
-        return False
+            found_node = find_cpp_node(child)
+            if found_node:
+                return found_node
+        return None
 
-    if has_cpp_type(root):
+    cpp_node = find_cpp_node(root)
+    if cpp_node:
+        node_text = cpp_node.text.decode("utf-8", errors="ignore").split("\n")[0]
+        logger.info(
+            f"'{file_path.name}' is likely a C++ header due to C++-only AST node type '{cpp_node.type}' with text: '{node_text}'"
+        )
         return True
 
     # If no C++-only node types found, treat as C header
     return False
+
+
+def is_c_exported(node: Node, file_path: Path) -> bool:
+    """
+    Check if a C function is exported.
+
+    For .c files, a function is exported unless it's 'static'.
+    For .h files, we treat all functions as exported from the graph's
+    perspective to model accessibility correctly.
+    """
+    if file_path.suffix != ".c":
+        return True
+
+    if node.type == "function_definition":
+        # For a function definition, check for the 'static' keyword.
+        for specifier in node.children:
+            if specifier.type == "storage_class_specifier" and (
+                specifier.text and specifier.text.decode("utf8") == "static"
+            ):
+                return False
+
+    return True
