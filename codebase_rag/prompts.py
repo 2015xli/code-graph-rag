@@ -23,6 +23,7 @@ Node Labels and Their Key Properties:
 
 Relationships (source)-[REL_TYPE]->(target):
 - (Project|Package|Folder) -[:CONTAINS_PACKAGE|CONTAINS_FOLDER|CONTAINS_FILE|CONTAINS_MODULE]-> (various)
+- File -[:PARSED_TO]-> Module
 - Module -[:DEFINES]-> (Class|Function)
 - Module -[:IMPORTS]-> Module
 - Module -[:EXPORTS]-> (Class|Function)

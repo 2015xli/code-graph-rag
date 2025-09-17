@@ -128,6 +128,9 @@ class DefinitionProcessor:
                 module_qn = ".".join(
                     [self.project_name] + list(relative_path.parent.parts)
                 )
+            elif language in ["c"]:
+                # In C, the module QN should include the file suffix to differentiate file.c and file.h
+                module_qn = ".".join([self.project_name] + list(relative_path.parts))
 
             # Populate the module QN to file path mapping for efficient lookups
             self.module_qn_to_file_path[module_qn] = file_path
@@ -156,6 +159,13 @@ class DefinitionProcessor:
             self.ingestor.ensure_relationship_batch(
                 (parent_label, parent_key, parent_val),
                 "CONTAINS_MODULE",
+                ("Module", "qualified_name", module_qn),
+            )
+
+            # Create a relationship from the File node to the Module node
+            self.ingestor.ensure_relationship_batch(
+                ("File", "path", relative_path_str),
+                "PARSED_TO",
                 ("Module", "qualified_name", module_qn),
             )
 
