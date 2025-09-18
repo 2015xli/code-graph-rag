@@ -101,13 +101,28 @@ LANGUAGE_CONFIGS = {
         import_from_node_types=["preproc_include"],
         function_query="""
             (function_definition
-               (function_declarator
+                (function_declarator
                     (identifier) @name) ) @function
+            (function_definition
+                (pointer_declarator
+                    (function_declarator
+                        (identifier) @name) ) ) @function
             """,
         call_query="""
             (call_expression
                 (identifier) @name ) @call
             """,
+        class_query="""
+        (struct_specifier
+            (type_identifier) @name
+            (field_declaration_list )) @class
+        (union_specifier
+            (type_identifier) @name
+            (field_declaration_list)) @class
+        (enum_specifier
+            (type_identifier) @name
+            (enumerator_list)) @class
+        """,
     ),
     "python": create_lang_config(
         file_extensions=[".py"],

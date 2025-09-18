@@ -16,6 +16,7 @@ from ..language_config import LanguageConfig
 from ..services.graph_service import MemgraphIngestor
 from .c_utils import (
     build_c_qualified_name,
+    extract_c_class_name,
     extract_c_function_name,
     is_c_exported,
 )
@@ -128,7 +129,7 @@ class DefinitionProcessor:
                 module_qn = ".".join(
                     [self.project_name] + list(relative_path.parent.parts)
                 )
-            elif language in ["c"]:
+            elif language == "c":
                 # In C, the module QN should include the file suffix to differentiate file.c and file.h
                 module_qn = ".".join([self.project_name] + list(relative_path.parts))
 
@@ -181,7 +182,9 @@ class DefinitionProcessor:
             self._ingest_all_functions(
                 root_node, module_qn, language, queries, file_path
             )
-            self._ingest_classes_and_methods(root_node, module_qn, language, queries)
+            self._ingest_classes_and_methods(
+                root_node, module_qn, language, queries, file_path
+            )
             self._ingest_object_literal_methods(root_node, module_qn, language, queries)
             self._ingest_commonjs_exports(root_node, module_qn, language, queries)
             self._ingest_es6_exports(root_node, module_qn, language, queries)
@@ -1014,7 +1017,12 @@ class DefinitionProcessor:
         return exported_class_nodes
 
     def _ingest_classes_and_methods(
-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+        self,
+        root_node: Node,
+        module_qn: str,
+        language: str,
+        queries: dict[str, Any],
+        file_path: Path,
     ) -> None:
         """Extract and ingest classes and their methods."""
         lang_queries = queries[language]
@@ -1089,6 +1097,13 @@ class DefinitionProcessor:
 
                 # Skip the rest of the processing for impl blocks
                 continue
+            elif language == "c":
+                class_name = extract_c_class_name(class_node)
+                if not class_name:
+                    continue
+                class_qn = build_c_qualified_name(class_node, module_qn, class_name)
+                is_exported = is_c_exported(class_node, file_path)
+
             else:
                 is_exported = False  # Default for non-C++ languages
                 class_name = self._extract_class_name(class_node)
@@ -1124,7 +1139,10 @@ class DefinitionProcessor:
                 node_type = "Type"
                 logger.info(f"  Found Type: {class_name} (qn: {class_qn})")
             elif class_node.type == "struct_specifier":
-                node_type = "Class"  # In C++, structs are essentially classes
+                if language == "c":
+                    node_type = "Struct"
+                else:
+                    node_type = "Class"  # In C++, structs are essentially classes
                 logger.info(f"  Found Struct: {class_name} (qn: {class_qn})")
             elif class_node.type == "union_specifier":
                 node_type = "Union"

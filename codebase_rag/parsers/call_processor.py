@@ -120,6 +120,9 @@ class CallProcessor:
                 module_qn = ".".join(
                     [self.project_name] + list(relative_path.parent.parts)
                 )
+            elif language == "c":
+                # In C, the module QN should include the file suffix to differentiate file.c and file.h
+                module_qn = ".".join([self.project_name] + list(relative_path.parts))
 
             self._process_calls_in_functions(root_node, module_qn, language, queries)
             self._process_calls_in_classes(root_node, module_qn, language, queries)

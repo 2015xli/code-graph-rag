@@ -5,63 +5,25 @@ from tree_sitter import Node, Parser
 
 
 def build_c_qualified_name(node: Node, module_qn: str, name: str) -> str:
-    """Build qualified name for C entities, handling namespaces properly."""
-    module_parts = module_qn.split(".")
-
-    is_module_file = (
-        len(module_parts) >= 3  # At least project.dir.filename
-        and (
-            "interfaces" in module_parts
-            or "modules" in module_parts
-            or any(part.endswith((".h", ".c")) for part in module_parts)
-        )
-    )
-
-    if is_module_file:
-        project_name = module_parts[0]
-        filename = module_parts[-1]
-        return f"{project_name}.{filename}.{name}"
-    else:
-        path_parts = []
-        current = node.parent
-
-        while current and current.type != "translation_unit":
-            if current.type == "namespace_definition":
-                namespace_name = None
-                name_node = current.child_by_field_name("name")
-                if name_node and name_node.text:
-                    namespace_name = name_node.text.decode("utf8")
-                else:
-                    for child in current.children:
-                        if (
-                            child.type in ["namespace_identifier", "identifier"]
-                            and child.text
-                        ):
-                            namespace_name = child.text.decode("utf8")
-                            break
-                if namespace_name:
-                    path_parts.append(namespace_name)
-            current = current.parent
-
-        path_parts.reverse()
-
-        if path_parts:
-            return f"{module_qn}.{'.'.join(path_parts)}.{name}"
-        else:
-            return f"{module_qn}.{name}"
+    """Build qualified name for C entities."""
+    return f"{module_qn}.{name}"
 
 
 def _extract_name_from_function_definition(func_node: Node) -> str | None:
     for child in func_node.children:
         if child.type == "function_declarator":
-            return extract_c_function_name(child)
+            return _extract_name_from_function_declarator(child)
+        elif child.type == "pointer_declarator":
+            for pointer_child in child.children:
+                if pointer_child.type == "function_declarator":
+                    return _extract_name_from_function_declarator(pointer_child)
     return None
 
 
 def _extract_name_from_declaration(func_node: Node) -> str | None:
     for child in func_node.children:
         if child.type == "function_declarator":
-            return extract_c_function_name(child)
+            return _extract_name_from_function_declarator(child)
     return None
 
 
@@ -85,6 +47,20 @@ def extract_c_function_name(func_node: Node) -> str | None:
 
     elif func_node.type == "function_declarator":
         return _extract_name_from_function_declarator(func_node)
+
+    return None
+
+
+def extract_c_class_name(class_node: Node) -> str | None:
+    if class_node.type not in ["struct_specifier", "union_specifier", "enum_specifier"]:
+        logger.warning(
+            f"Invalid node type: {class_node.type} in extract_c_class_name for node: {class_node})"
+        )
+        return None
+
+    for child in class_node.children:
+        if child.type in ["type_identifier"] and child.text:
+            return child.text.decode("utf8") if child.text else None
 
     return None
 
@@ -224,7 +200,7 @@ def is_c_exported(node: Node, file_path: Path) -> bool:
     For .h files, we treat all functions as exported from the graph's
     perspective to model accessibility correctly.
     """
-    if file_path.suffix != ".c":
+    if file_path.suffix == ".h":
         return True
 
     if node.type == "function_definition":
