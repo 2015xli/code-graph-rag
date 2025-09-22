@@ -1,0 +1,622 @@
+diff --git a/codebase_rag/graph_updater.py b/codebase_rag/graph_updater.py
+index 2e5df50..f6c36cd 100644
+--- a/codebase_rag/graph_updater.py
++++ b/codebase_rag/graph_updater.py
+@@ -16,6 +16,7 @@ from tree_sitter import Node, Parser
+
+ from .config import IGNORE_PATTERNS
+ from .language_config import get_language_config
++from .parsers.c_utils import determine_if_cpp_header
+ from .parsers.factory import ProcessorFactory
+ from .services.graph_service import MemgraphIngestor
+
+@@ -244,6 +245,8 @@ class GraphUpdater:
+         self.simple_name_lookup: dict[str, set[str]] = defaultdict(set)
+         self.ast_cache = BoundedASTCache(max_entries=1000, max_memory_mb=500)
+         self.ignore_dirs = IGNORE_PATTERNS
++        self.c_folders: list[Path] = []
++        self.cpp_folders: list[Path] = []
+
+         # Create processor factory with all dependencies
+         self.factory = ProcessorFactory(
+@@ -369,9 +372,26 @@ class GraphUpdater:
+
+         # Use pathlib.rglob for more efficient file iteration
+         for filepath in self.repo_path.rglob("*"):
++            suffix = filepath.suffix
+             if filepath.is_file() and not should_skip_path(filepath):
++                if suffix == ".h":
++                    if (
++                        filepath.parent not in self.c_folders
++                        and filepath.parent not in self.cpp_folders
++                    ):
++                        is_cpp_header = determine_if_cpp_header(
++                            filepath, self.parsers["cpp"]
++                        )
++                        if is_cpp_header:
++                            self.cpp_folders.append(filepath.parent)
++                            suffix = ".hpp"
++                        else:
++                            self.c_folders.append(filepath.parent)
++                    elif filepath.parent in self.cpp_folders:
++                        suffix = ".hpp"
++
+                 # Check if this file type is supported for parsing
+-                lang_config = get_language_config(filepath.suffix)
++                lang_config = get_language_config(suffix)
+                 if lang_config and lang_config.name in self.parsers:
+                     # Parse as Module and cache AST
+                     result = self.factory.definition_processor.process_file(
+diff --git a/codebase_rag/language_config.py b/codebase_rag/language_config.py
+index 33da8dc..5b8a7ea 100644
+--- a/codebase_rag/language_config.py
++++ b/codebase_rag/language_config.py
+@@ -79,6 +79,51 @@ class LanguageConfig:
+ ################################################################################
+
+ LANGUAGE_CONFIGS = {
++    "c": create_lang_config(
++        file_extensions=[
++            ".c",
++            ".h",
++        ],
++        function_node_types=[
++            "function_definition",
++            # "preproc_def",
++        ],
++        class_node_types=[
++            "struct_specifier",
++            "union_specifier",
++            "enum_specifier",
++        ],
++        module_node_types=[],
++        call_node_types=[
++            "call_expression",
++        ],
++        import_node_types=["preproc_include"],
++        import_from_node_types=["preproc_include"],
++        function_query="""
++            (function_definition
++                (function_declarator
++                    (identifier) @name) ) @function
++            (function_definition
++                (pointer_declarator
++                    (function_declarator
++                        (identifier) @name) ) ) @function
++            """,
++        call_query="""
++            (call_expression
++                (identifier) @name ) @call
++            """,
++        class_query="""
++        (struct_specifier
++            (type_identifier) @name
++            (field_declaration_list )) @class
++        (union_specifier
++            (type_identifier) @name
++            (field_declaration_list)) @class
++        (enum_specifier
++            (type_identifier) @name
++            (enumerator_list)) @class
++        """,
++    ),
+     "python": create_lang_config(
+         file_extensions=[".py"],
+         function_node_types=["function_definition"],
+@@ -255,6 +300,7 @@ LANGUAGE_CONFIGS = {
+     ),
+     "cpp": create_lang_config(
+         file_extensions=[
++            # ".c",
+             ".cpp",
+             ".h",
+             ".hpp",
+diff --git a/codebase_rag/parser_loader.py b/codebase_rag/parser_loader.py
+index 18f3da4..33b8eb3 100644
+--- a/codebase_rag/parser_loader.py
++++ b/codebase_rag/parser_loader.py
+@@ -88,6 +88,13 @@ def _import_language_loaders() -> dict[str, LanguageLoader]:
+     """Import language loaders with proper error handling and typing."""
+     loaders: dict[str, LanguageLoader] = {}
+
++    try:
++        from tree_sitter_c import language as c_language_so
++
++        loaders["c"] = c_language_so
++    except ImportError:
++        loaders["c"] = _try_load_from_submodule("c")
++
+     try:
+         from tree_sitter_python import language as python_language_so
+
+diff --git a/codebase_rag/parsers/c_utils.py b/codebase_rag/parsers/c_utils.py
+new file mode 100644
+index 0000000..e3c37f8
+--- /dev/null
++++ b/codebase_rag/parsers/c_utils.py
+@@ -0,0 +1,214 @@
++from pathlib import Path
++
++from loguru import logger
++from tree_sitter import Node, Parser
++
++
++def build_c_qualified_name(node: Node, module_qn: str, name: str) -> str:
++    """Build qualified name for C entities."""
++    return f"{module_qn}.{name}"
++
++
++def _extract_name_from_function_definition(func_node: Node) -> str | None:
++    for child in func_node.children:
++        if child.type == "function_declarator":
++            return _extract_name_from_function_declarator(child)
++        elif child.type == "pointer_declarator":
++            for pointer_child in child.children:
++                if pointer_child.type == "function_declarator":
++                    return _extract_name_from_function_declarator(pointer_child)
++    return None
++
++
++def _extract_name_from_declaration(func_node: Node) -> str | None:
++    for child in func_node.children:
++        if child.type == "function_declarator":
++            return _extract_name_from_function_declarator(child)
++    return None
++
++
++def _extract_name_from_function_declarator(func_node: Node) -> str | None:
++    for child in func_node.children:
++        if child.type in ["identifier"] and child.text:
++            return child.text.decode("utf8") if child.text else None
++    return None
++
++
++def extract_c_function_name(func_node: Node) -> str | None:
++    if func_node.type in [
++        "function_definition",
++    ]:
++        return _extract_name_from_function_definition(func_node)
++
++    elif func_node.type in [
++        "declaration",
++    ]:
++        return _extract_name_from_declaration(func_node)
++
++    elif func_node.type == "function_declarator":
++        return _extract_name_from_function_declarator(func_node)
++
++    return None
++
++
++def extract_c_class_name(class_node: Node) -> str | None:
++    if class_node.type not in ["struct_specifier", "union_specifier", "enum_specifier"]:
++        logger.warning(
++            f"Invalid node type: {class_node.type} in extract_c_class_name for node: {class_node})"
++        )
++        return None
++
++    for child in class_node.children:
++        if child.type in ["type_identifier"] and child.text:
++            return child.text.decode("utf8") if child.text else None
++
++    return None
++
++
++# Suffixes that indicate C++ source files
++CPP_SOURCE_SUFFIXES = {
++    ".cpp",
++    ".hpp",
++    ".cc",
++    ".cxx",
++    ".hxx",
++    ".hh",
++    ".ixx",
++    ".cppm",
++    ".ccm",
++}
++
++# The set of node.types in tree-sitter-cpp grammar that unambiguously indicate C++-only semantics
++CPP_ONLY_NODE_TYPES = {
++    "abstract_declarator",
++    "access_specifier",  # public: private: etc.
++    "alias_declaration",  # using T = int;
++    "alignas_specifier",  # C++11 alignas
++    "attribute_declaration",  # [[nodiscard]] etc.
++    "auto",  # auto type deduction
++    "class_specifier",  # class definitions
++    "concept_definition",  # C++20 concept
++    "decltype_specifier",  # decltype(x)
++    "delete_expression",  # delete ptr
++    "dependent_type_specifier",  # dependent types in templates
++    "enum_class_specifier",  # enum class
++    "explicit_specifier",  # explicit keyword
++    "friend_declaration",  # friend class X;
++    "lambda_expression",  # lambdas
++    "namespace_definition",  # namespace N {}
++    "new_expression",  # new T()
++    "noexcept_specifier",  # noexcept
++    "operator_cast",  # conversion operators
++    "override_specifier",  # override keyword
++    "parameter_pack_expansion",  # T... variadic
++    "qualified_identifier",  # std::vector etc.
++    "reference_declarator",  # T& or T&&
++    "static_assert_declaration",  # static_assert(...)
++    "template_argument_list",  # std::vector<int> etc.
++    "template_declaration",  # template<typename T>
++    "template_function",  # function templates
++    "template_method",  # methods in template classes
++    "template_parameter_list",
++    "template_type",
++    "this",  # this pointer
++    "throw_specifier",  # throw() specifiers (older C++)
++    "using_declaration",  # using namespace etc.
++    "virtual_function_specifier",  # virtual keyword
++    "virtual_specifier",  # final, etc.
++}
++
++
++def determine_if_cpp_header(file_path: Path, cpp_parser: Parser) -> bool:
++    """
++    Determines if a .h file should be treated as a C++ header.
++
++    Returns True if it's likely a C++ header (has C++-only AST constructs
++    or there are sibling C++ source files), otherwise False (treat as C header).
++    """
++
++    # 1. Sibling check: same directory, any file with C++ suffix
++    parent = file_path.parent
++    try:
++        has_c_source = False
++        for sibling in parent.iterdir():
++            if sibling == file_path:
++                continue
++            if sibling.is_file():
++                if sibling.suffix.lower() in CPP_SOURCE_SUFFIXES:
++                    logger.info(
++                        f"'{file_path.name}' is likely a C++ header due to sibling file: '{sibling.name}'"
++                    )
++                    return True
++                elif sibling.suffix.lower() == ".c":
++                    has_c_source = True
++
++        if has_c_source:
++            # If there is no C++ source file, but is C source files, then it's a C header
++            logger.info(
++                f"'{file_path.name}' is likely a C header due to sibling file: '{sibling.name}'"
++            )
++            return False
++
++    except Exception:
++        # If directory listing fails, ignore sibling heuristic
++        pass
++
++    # 2. Parse with tree-sitter-cpp parser, since there is no C++ or C source file
++    try:
++        source_bytes = file_path.read_bytes()
++        # Alternatively: read text and encode utf-8
++    except Exception:
++        # If can't read file, conservatively treat as C header
++        return False
++
++    # If file is empty or nearly so, no strong indication of C++
++    if not source_bytes.strip():
++        return False
++
++    tree = cpp_parser.parse(source_bytes)
++    root: Node = tree.root_node
++
++    # Recursive search for any node whose type is in CPP_ONLY_NODE_TYPES
++    def find_cpp_node(node: Node) -> Node | None:
++        if node.type in CPP_ONLY_NODE_TYPES:
++            return node
++        # Recurse into named children (faster / more relevant than all children)
++        for child in node.named_children:
++            # Early exit
++            found_node = find_cpp_node(child)
++            if found_node:
++                return found_node
++        return None
++
++    cpp_node = find_cpp_node(root)
++    if cpp_node:
++        node_text = cpp_node.text.decode("utf-8", errors="ignore").split("\n")[0]
++        logger.info(
++            f"'{file_path.name}' is likely a C++ header due to C++-only AST node type '{cpp_node.type}' with text: '{node_text}'"
++        )
++        return True
++
++    # If no C++-only node types found, treat as C header
++    return False
++
++
++def is_c_exported(node: Node, file_path: Path) -> bool:
++    """
++    Check if a C function is exported.
++
++    For .c files, a function is exported unless it's 'static'.
++    For .h files, we treat all functions as exported from the graph's
++    perspective to model accessibility correctly.
++    """
++    if file_path.suffix == ".h":
++        return True
++
++    if node.type == "function_definition":
++        # For a function definition, check for the 'static' keyword.
++        for specifier in node.children:
++            if specifier.type == "storage_class_specifier" and (
++                specifier.text and specifier.text.decode("utf8") == "static"
++            ):
++                return False
++
++    return True
+diff --git a/codebase_rag/parsers/call_processor.py b/codebase_rag/parsers/call_processor.py
+index d6ad86a..3eba60e 100644
+--- a/codebase_rag/parsers/call_processor.py
++++ b/codebase_rag/parsers/call_processor.py
+@@ -9,6 +9,7 @@ from tree_sitter import Node, QueryCursor
+
+ from ..language_config import LanguageConfig
+ from ..services.graph_service import MemgraphIngestor
++from .c_utils import build_c_qualified_name, extract_c_function_name
+
+ # No longer need constants import - using Tree-sitter directly
+ from .cpp_utils import convert_operator_symbol_to_name, extract_cpp_function_name
+@@ -119,10 +120,16 @@ class CallProcessor:
+                 module_qn = ".".join(
+                     [self.project_name] + list(relative_path.parent.parts)
+                 )
++            elif language == "c":
++                # In C, the module QN should include the file suffix to differentiate file.c and file.h
++                module_qn = ".".join([self.project_name] + list(relative_path.parts))
+
+             self._process_calls_in_functions(root_node, module_qn, language, queries)
+             self._process_calls_in_classes(root_node, module_qn, language, queries)
+-            self._process_module_level_calls(root_node, module_qn, language, queries)
++            if language != "c":
++                self._process_module_level_calls(
++                    root_node, module_qn, language, queries
++                )
+
+         except Exception as e:
+             logger.error(f"Failed to process calls in {file_path}: {e}")
+@@ -144,12 +151,19 @@ class CallProcessor:
+             if self._is_method(func_node, lang_config):
+                 continue
+
++            func_qn = None
+             # Extract function name using appropriate method for language
+             if language == "cpp":
+                 # For C++, use utility functions instead of creating a temporary instance
+                 func_name = extract_cpp_function_name(func_node)
+                 if not func_name:
+                     continue
++            elif language == "c":
++                func_name = extract_c_function_name(func_node)
++                if not func_name:
++                    continue
++                func_qn = build_c_qualified_name(func_node, module_qn, func_name)
++
+             else:
+                 name_node = func_node.child_by_field_name("name")
+                 if not name_node:
+@@ -158,9 +172,11 @@ class CallProcessor:
+                 if text is None:
+                     continue
+                 func_name = text.decode("utf8")
+-            func_qn = self._build_nested_qualified_name(
+-                func_node, module_qn, func_name, lang_config
+-            )
++
++            if func_qn is None:
++                func_qn = self._build_nested_qualified_name(
++                    func_node, module_qn, func_name, lang_config
++                )
+
+             if func_qn:
+                 self._ingest_function_calls(
+diff --git a/codebase_rag/parsers/definition_processor.py b/codebase_rag/parsers/definition_processor.py
+index 111c527..1508047 100644
+--- a/codebase_rag/parsers/definition_processor.py
++++ b/codebase_rag/parsers/definition_processor.py
+@@ -14,6 +14,12 @@ from tree_sitter import Node, Query, QueryCursor
+
+ from ..language_config import LanguageConfig
+ from ..services.graph_service import MemgraphIngestor
++from .c_utils import (
++    build_c_qualified_name,
++    extract_c_class_name,
++    extract_c_function_name,
++    is_c_exported,
++)
+
+ # No longer need constants import - using Tree-sitter directly
+ from .cpp_utils import (
+@@ -123,6 +129,9 @@ class DefinitionProcessor:
+                 module_qn = ".".join(
+                     [self.project_name] + list(relative_path.parent.parts)
+                 )
++            elif language == "c":
++                # In C, the module QN should include the file suffix to differentiate file.c and file.h
++                module_qn = ".".join([self.project_name] + list(relative_path.parts))
+
+             # Populate the module QN to file path mapping for efficient lookups
+             self.module_qn_to_file_path[module_qn] = file_path
+@@ -154,6 +163,13 @@ class DefinitionProcessor:
+                 ("Module", "qualified_name", module_qn),
+             )
+
++            # Create a relationship from the File node to the Module node
++            self.ingestor.ensure_relationship_batch(
++                ("File", "path", relative_path_str),
++                "PARSED_TO",
++                ("Module", "qualified_name", module_qn),
++            )
++
+             self.import_processor.parse_imports(root_node, module_qn, language, queries)
+             self._ingest_missing_import_patterns(
+                 root_node, module_qn, language, queries
+@@ -163,8 +179,12 @@ class DefinitionProcessor:
+                 self._ingest_cpp_module_declarations(
+                     root_node, module_qn, file_path, queries
+                 )
+-            self._ingest_all_functions(root_node, module_qn, language, queries)
+-            self._ingest_classes_and_methods(root_node, module_qn, language, queries)
++            self._ingest_all_functions(
++                root_node, module_qn, language, queries, file_path
++            )
++            self._ingest_classes_and_methods(
++                root_node, module_qn, language, queries, file_path
++            )
+             self._ingest_object_literal_methods(root_node, module_qn, language, queries)
+             self._ingest_commonjs_exports(root_node, module_qn, language, queries)
+             self._ingest_es6_exports(root_node, module_qn, language, queries)
+@@ -586,7 +606,12 @@ class DefinitionProcessor:
+         )
+
+     def _ingest_all_functions(
+-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
++        self,
++        root_node: Node,
++        module_qn: str,
++        language: str,
++        queries: dict[str, Any],
++        file_path: Path,
+     ) -> None:
+         """Extract and ingest all functions (including nested ones)."""
+         lang_queries = queries[language]
+@@ -621,6 +646,12 @@ class DefinitionProcessor:
+                 func_qn = build_cpp_qualified_name(func_node, module_qn, func_name)
+                 # Check if this is an exported function
+                 is_exported = is_cpp_exported(func_node)
++            elif language == "c":
++                func_name = extract_c_function_name(func_node)
++                if not func_name:
++                    continue
++                func_qn = build_c_qualified_name(func_node, module_qn, func_name)
++                is_exported = is_c_exported(func_node, file_path)
+             else:
+                 is_exported = False  # Default for non-C++ languages
+                 # Extract function name - handle arrow functions specially
+@@ -668,7 +699,10 @@ class DefinitionProcessor:
+             self.ingestor.ensure_node_batch("Function", func_props)
+
+             self.function_registry[func_qn] = "Function"
+-            self.simple_name_lookup[func_name].add(func_qn)
++            if (
++                func_name is not None
++            ):  # Only add to simple_name_lookup if func_name is not None
++                self.simple_name_lookup[func_name].add(func_qn)
+
+             # Determine parent and create proper relationship
+             parent_type, parent_qn = self._determine_function_parent(
+@@ -689,11 +723,16 @@ class DefinitionProcessor:
+                 )
+
+     def _ingest_top_level_functions(
+-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
++        self,
++        root_node: Node,
++        module_qn: str,
++        language: str,
++        queries: dict[str, Any],
++        file_path: Path,
+     ) -> None:
+         """Extract and ingest top-level functions. (Legacy method, replaced by _ingest_all_functions)"""
+         # Keep for backward compatibility, but delegate to new method
+-        self._ingest_all_functions(root_node, module_qn, language, queries)
++        self._ingest_all_functions(root_node, module_qn, language, queries, file_path)
+
+     def _build_nested_qualified_name(
+         self,
+@@ -978,7 +1017,12 @@ class DefinitionProcessor:
+         return exported_class_nodes
+
+     def _ingest_classes_and_methods(
+-        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
++        self,
++        root_node: Node,
++        module_qn: str,
++        language: str,
++        queries: dict[str, Any],
++        file_path: Path,
+     ) -> None:
+         """Extract and ingest classes and their methods."""
+         lang_queries = queries[language]
+@@ -1053,6 +1097,13 @@ class DefinitionProcessor:
+
+                 # Skip the rest of the processing for impl blocks
+                 continue
++            elif language == "c":
++                class_name = extract_c_class_name(class_node)
++                if not class_name:
++                    continue
++                class_qn = build_c_qualified_name(class_node, module_qn, class_name)
++                is_exported = is_c_exported(class_node, file_path)
++
+             else:
+                 is_exported = False  # Default for non-C++ languages
+                 class_name = self._extract_class_name(class_node)
+@@ -1088,7 +1139,10 @@ class DefinitionProcessor:
+                 node_type = "Type"
+                 logger.info(f"  Found Type: {class_name} (qn: {class_qn})")
+             elif class_node.type == "struct_specifier":
+-                node_type = "Class"  # In C++, structs are essentially classes
++                if language == "c":
++                    node_type = "Struct"
++                else:
++                    node_type = "Class"  # In C++, structs are essentially classes
+                 logger.info(f"  Found Struct: {class_name} (qn: {class_qn})")
+             elif class_node.type == "union_specifier":
+                 node_type = "Union"
+diff --git a/codebase_rag/prompts.py b/codebase_rag/prompts.py
+index 105d7ba..bafd69c 100644
+--- a/codebase_rag/prompts.py
++++ b/codebase_rag/prompts.py
+@@ -23,6 +23,7 @@ Node Labels and Their Key Properties:
+
+ Relationships (source)-[REL_TYPE]->(target):
+ - (Project|Package|Folder) -[:CONTAINS_PACKAGE|CONTAINS_FOLDER|CONTAINS_FILE|CONTAINS_MODULE]-> (various)
++- File -[:PARSED_TO]-> Module
+ - Module -[:DEFINES]-> (Class|Function)
+ - Module -[:IMPORTS]-> Module
+ - Module -[:EXPORTS]-> (Class|Function)
+diff --git a/codebase_rag/services/graph_service.py b/codebase_rag/services/graph_service.py
+index 24e23b0..a51d7ce 100644
+--- a/codebase_rag/services/graph_service.py
++++ b/codebase_rag/services/graph_service.py
+@@ -22,6 +22,9 @@ class MemgraphIngestor:
+             "Folder": "path",
+             "Module": "qualified_name",
+             "Class": "qualified_name",
++            "Struct": "qualified_name",
++            "Union": "qualified_name",
++            "Enum": "qualified_name",
+             "Function": "qualified_name",
+             "Method": "qualified_name",
+             "File": "path",
+diff --git a/docker-compose.yaml b/docker-compose.yaml
+index 5c4a52f..f5766a2 100644
+--- a/docker-compose.yaml
++++ b/docker-compose.yaml
+@@ -1,13 +1,19 @@
+-version: "3"
+ services:
+   memgraph:
+     image: memgraph/memgraph-mage
+     ports:
+       - "${MEMGRAPH_PORT:-7687}:7687"
+       - "${MEMGRAPH_HTTP_PORT:-7444}:7444"
++    command: ["--query-execution-timeout-sec=0"]
++    volumes:
++      - code-graph:/var/lib/memgraph
+   lab:
+     image: memgraph/lab
+     ports:
+       - "${LAB_PORT:-3000}:3000"
+     environment:
+-      QUICK_CONNECT_MG_HOST: memgraph
++        QUICK_CONNECT_MG_HOST: memgraph
++        QUICK_CONNECT_MG_PORT: 7687
++        QUICK_CONNECT_MG_LOGS_PORT: 7444
++volumes:
++  code-graph:
